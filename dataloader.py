@@ -56,34 +56,3 @@ class BirdClefDataGen(tf.keras.utils.Sequence):
     def __len__(self):
         return self.n // self.batch_size
 
-def parse_function(image, extra_features, label):
-    image_string = tf.io.read_file(image)
-
-    #Don't use tf.image.decode_image, or the output shape will be undefined
-    image = tf.image.decode_png(image_string, channels=1)
-
-    #This will convert to float values in [0, 1]
-    image = tf.image.convert_image_dtype(image, tf.float32)
-
-    
-    return image, extra_features, label
-
-def get_dataset(base_dir, batch_size, num_classes, max_size=0):
-    df = pd.read_csv(os.path.join(base_dir, "metadata.csv"))
-    df['labels'] = df['labels'].apply(lambda s: list(ast.literal_eval(s)))
-    filenames = [os.path.join(base_dir, f) for f in df['filename']]
-    labels = np.array([l[0] for l in df['labels']])
-    labels = tf.keras.utils.to_categorical(labels)
-    extra_features = df[['latitude', 'longitude', 'month']].to_numpy()
-    scaler = StandardScaler()
-    scaled_extra_features = scaler.fit_transform(extra_features)
-    if max_size > 0:
-        filenames = filenames[:max_size]
-        labels = labels[:max_size]
-        scaled_extra_features = scaled_extra_features[:max_size]
-    dataset = tf.data.Dataset.from_tensor_slices((filenames, scaled_extra_features, labels))
-    dataset = dataset.shuffle(len(filenames))
-    dataset = dataset.map(parse_function, num_parallel_calls=8)
-    dataset = dataset.batch(batch_size)
-    dataset = dataset.prefetch(10)
-    return dataset
