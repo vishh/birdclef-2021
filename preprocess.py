@@ -10,14 +10,18 @@ from progress.bar import Bar
 import png
 import multiprocessing as mp
 from tqdm import tqdm
+import soundfile as sf
+from scipy import signal
 
 from absl import app
 from absl import flags
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('base_data_path', './birdclef-2021', 'Path to the base directory that contains all the raw audio data.')
+flags.DEFINE_string('base_data_path', './birdclef-2021', 'Path to the base directory that contains all the wav audio data.')
 flags.DEFINE_string('preprocess_output_dir', './preprocessed', "Path to the base directory that will contain all pre-processed audio data")
+flags.DEFINE_string('output_kind', 'mel', 'Output kind one of `mel` or `wav` where the former results in files with mel spectogram stored as png files and latter results in audio data stored as ogg files')
+flags.DEFINE_integer('window_seconds', 5, 'Windowing time duration.')
 
 def main(argv):
     trainMetadataDF = pd.read_csv(os.path.join(FLAGS.base_data_path, 'train_metadata.csv'))
@@ -49,7 +53,7 @@ def main(argv):
 
         metadata_dfs = []
         for idx in tqdm(range(df.shape[0])):
-            out = process_row(df,idx,FLAGS.base_data_path,folder,classes)
+            out = process_row(df,idx,FLAGS.base_data_path,folder,classes, FLAGS.window_seconds, FLAGS.output_kind)
             if out is not None:
                 metadata_dfs.append(out)
 
@@ -57,9 +61,9 @@ def main(argv):
         metadata_df.to_csv(os.path.join(folder, 'metadata.csv'))
         bar.finish()
 
-def process_row(df, idx, base_path, output_path, classes, sr=32000):
+def process_row(df, idx, base_path, output_path, classes, window, output_kind, sr=32000):
     row = df.iloc[idx]
-    batches = get_batches(row, base_path, sr)            
+    batches = get_batches(row, base_path, window, output_kind, sr)            
     month = int(row['date'].split('-')[1])
     labels = [classes[i] for i in [row['primary_label']]+row['secondary_labels'] if i in classes]
     latitude = row['latitude']
@@ -68,14 +72,20 @@ def process_row(df, idx, base_path, output_path, classes, sr=32000):
     for bi, b in enumerate(batches):
         if b.sum() == 0:
             continue
+        filetype = "wav"
+        if output_kind == "mel":
+            filetype = "png"
         filename = os.path.join(output_path,
-                                "{}_{}_{}.png".format(
-                                    row['primary_label'], os.path.splitext(row['filename'])[0],bi))
+                                "{}_{}_{}.{}".format(
+                                    row['primary_label'], os.path.splitext(row['filename'])[0],bi, filetype))
         if not os.path.exists(filename):
-            png.from_array(b, mode="L").save(filename)
-        metadata_dfs.append(
+            if output_kind == "mel":
+                png.from_array(b, mode="L").save(filename)
+            else:
+                sf.write(filename, b, sr, "PCM_16")
+            metadata_dfs.append(
             pd.DataFrame({
-                'row_id': "{}_{}_{}".format(row['primary_label'], idx, bi),'labels':[labels], 'filename':filename, 'latitude':latitude, 'longitude':longitude, 'month':month}))
+                'row_id': "{}_{}_{}".format(row['primary_label'], idx, bi),'labels':[labels], 'filename':os.path.basename(filename), 'latitude':latitude, 'longitude':longitude, 'month':month}))
 
     if len(metadata_dfs) == 0 :
         return None
@@ -91,18 +101,23 @@ def get_mel_spec(x, sr):
     M_db = librosa.power_to_db(M, ref=np.max)
     return M_db
 
-def get_batches(df, base_path, sr=32000):
+def get_batches(df, base_path, window, output_kind, sr=32000):
     shortAudioPath = os.path.join(base_path, 'train_short_audio')
     audio_data = os.path.join(shortAudioPath, df['primary_label'], df['filename'])
     x, sr = librosa.load(audio_data, sr=sr, mono=True)
-    batchLen = 5*sr
+    batchLen = window*sr
     result = [] 
     for i in range(len(x)//batchLen):
         b = x[i*batchLen:(i+1)*batchLen]
         if len(b) < batchLen:
             break
-        mel = get_mel_spec(b, sr)
-        result.append(mel)
+        sos = signal.butter(10, [150,15000], 'bandpass', fs=sr, output='sos')
+        b = signal.sosfilt(sos, b)
+        if output_kind == "mel":
+            b = get_mel_spec(b, sr)
+        result.append(b)
+    if output_kind == "wav":
+        return result
     eps = 1e-6
     X = np.array(result)
     # Standardize
