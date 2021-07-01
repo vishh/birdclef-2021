@@ -16,5 +16,7 @@ The dataset is large (20G+) and so to evaluate model architectures use a smaller
 Adjust `--batch_size` based on the number of GPUs and memory available.
 
 TODO:
-1. Evaluate a few popular CNN architectures and publish evaluation metrics
-2. Generate new samples with raw audio data, possibly with some prefiltering to reduce background noise. Then attempt to learn directly using dialated CNSs.
+
+1. Add non birdcall sounds to the dataset to have the model learn to identify birdcalls in addition to classifying them.
+1. Evaluate a few popular CNN architectures and publish evaluation metrics. Started with NasNetMobile
+1. Generate new samples with raw audio data, possibly with some prefiltering to reduce background noise. Then attempt to learn directly using dialated CNSs.

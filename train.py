@@ -125,7 +125,7 @@ def make_or_restore_model(checkpoint_dir, X, num_classes):
     model = NasnetModel((X['input_1'].shape[1:], X['input_2'].shape[1:]), num_classes)
     model.compile(
         loss=tf.keras.losses.CategoricalCrossentropy(),
-        optimizer=tf.keras.optimizers.RMSprop(),
+        optimizer=tf.keras.optimizers.Adam(),
         metrics=["accuracy", tf.keras.metrics.CategoricalAccuracy(), tf.keras.metrics.PrecisionAtRecall(0.8)],#, "precision", "recall"],
     )
 
