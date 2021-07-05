@@ -11,13 +11,15 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
 import tensorflow as tf
+from tensorflow import keras
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('data_path','', 'Path to a directory containing training data')
 flags.DEFINE_string('ckpt_dir', '', 'Path to a directory expected to contain model checkpoints')
+flags.DEFINE_string('model_kind', 'basic_cnn', 'kind of model to train. One of "basic_cnn" or "nasnetmobile"')
 flags.DEFINE_integer('batch_size', 2048, 'Batch Size for training')
-flags.DEFINE_integer('epochs', 200, 'Number of epochs to train over the dataset')
+flags.DEFINE_integer('epochs', 20, 'Number of epochs to train over the dataset')
 flags.DEFINE_float('data_percent', 0.2, 'Percentage of training data to use for training')
 
 def parse_function(x, label):
@@ -37,7 +39,7 @@ def get_dataset(base_dir, batch_size, num_classes, percent=1):
     df['labels'] = df['labels'].apply(lambda s: list(ast.literal_eval(s)))
     filenames = np.array([os.path.join(base_dir, f) for f in df['filename']])
     labels = np.array([l[0]-1 for l in df['labels']])
-    labels_onehot = tf.keras.utils.to_categorical(labels, num_classes=num_classes)
+    labels_onehot = keras.utils.to_categorical(labels, num_classes=num_classes)
     extra_features = df[['latitude', 'longitude', 'month']].to_numpy()
     scaler = StandardScaler()
     scaled_extra_features = scaler.fit_transform(extra_features)
@@ -70,68 +72,99 @@ def main(argv):
     strategy = tf.distribute.MirroredStrategy()
     print("Number of devices: {}".format(strategy.num_replicas_in_sync))
     # Prepare a directory to store all the checkpoints.
-    os.makedirs(FLAGS.ckpt_dir, exist_ok=True)
+    os.makedirs(os.path.join(FLAGS.ckpt_dir, FLAGS.model_kind), exist_ok=True)
+    os.makedirs(os.path.join("./logs", FLAGS.model_kind), exist_ok=True)
     # Open a strategy scope.
     with strategy.scope():
             # Everything that creates variables should be under the strategy scope.
             # In general this is only model construction & `compile()`.
-        model = make_or_restore_model(FLAGS.ckpt_dir, X, num_classes)
+        model = make_or_restore_model(FLAGS.model_kind, FLAGS.ckpt_dir, X, num_classes)
         print(model.summary())
 
  #   train_dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
  #   val_dist_dataset = strategy.experimental_distribute_dataset(val_dataset)
-    #tf.keras.utils.plot_model(model, "nasnet.png")
+    #keras.utils.plot_model(model, "nasnet.png")
     callbacks = [
                 # This callback saves a SavedModel every epoch
                 # We include the current epoch in the folder name.
-                tf.keras.callbacks.ModelCheckpoint(
-                                filepath=FLAGS.ckpt_dir + "/ckpt-{epoch}", save_freq="epoch"
-                            )
-            ]
+        keras.callbacks.ModelCheckpoint(
+            filepath=os.path.join(FLAGS.ckpt_dir, FLAGS.model_kind,"ckpt-{epoch}"), save_freq="epoch"
+        ),
+        keras.callbacks.TensorBoard(log_dir="./logs/{}".format(FLAGS.model_kind))
+        
+    ]
     
     history = model.fit(train_dataset, callbacks=callbacks, validation_data=val_dataset, use_multiprocessing=False, epochs=FLAGS.epochs, verbose=1)
     
     test_scores = model.evaluate(val_dataset,verbose=2)
     print("Test loss:", test_scores[0])
-    print("Test accuracy:", test_scores)
+    print("Test scores:", test_scores)
 #    print(test_scores)
     return
 
 def NasnetModel(input_shapes, num_classes, pooling="avg"):
-    input_1 = tf.keras.Input(shape=input_shapes[0], name="input_1")
-    base = tf.keras.applications.NASNetMobile(
+    input_1 = keras.Input(shape=input_shapes[0], name="input_1")
+    base = keras.applications.NASNetMobile(
         input_shape=input_shapes[0],
         include_top=False,
         weights=None,
         input_tensor=None,
         pooling=pooling)
-    flat = tf.keras.layers.Flatten()(base(input_1))
-    input_2 = tf.keras.Input(shape = input_shapes[1], name="input_2")
-    concatenatedFeatures = tf.keras.layers.Concatenate(axis = 1)([flat, input_2])
-    dense = tf.keras.layers.Dense(512)(concatenatedFeatures)
-    outputs = tf.keras.layers.Dense(num_classes, activation=tf.keras.activations.softmax)(dense)
-    m = tf.keras.Model(inputs=[input_1, input_2], outputs=outputs, name="nasnet_model")
+    flat = keras.layers.Flatten()(base(input_1))
+    input_2 = keras.Input(shape = input_shapes[1], name="input_2")
+    concatenatedFeatures = keras.layers.Concatenate(axis = 1)([flat, input_2])
+    dense = keras.layers.Dense(32)(concatenatedFeatures)
+    outputs = keras.layers.Dense(num_classes, activation=keras.activations.softmax)(dense)
+    m = keras.Model(inputs=[input_1, input_2], outputs=outputs, name="nasnet_model")
     return m
+
+def dilated_cnn_block(x, filters, input_shape, layer_idx, dropout):
+    x = keras.layers.Conv2D(filters, (3, 3), dilation_rate=layer_idx,
+                            padding='same',
+                            input_shape=input_shape)(x)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.Activation('relu')(x)
+    x = keras.layers.Dropout(dropout)(x)
     
-def make_or_restore_model(checkpoint_dir, X, num_classes):
+    return x
+    
+def make_or_restore_model(model_kind, checkpoint_dir, X, num_classes):
         # Either restore the latest model, or create a fresh one
         # if there is no checkpoint available.
-    checkpoints = [checkpoint_dir + "/" + name for name in os.listdir(checkpoint_dir)]
+    checkpoints = [os.path.join(checkpoint_dir,model_kind, name) for name in os.listdir(os.path.join(checkpoint_dir, model_kind))]
     if checkpoints:
         latest_checkpoint = max(checkpoints, key=os.path.getctime)
         print("Restoring from", latest_checkpoint)
-        return tf.keras.models.load_model(latest_checkpoint)
-    print("Creating a new model")
-    model = NasnetModel((X['input_1'].shape[1:], X['input_2'].shape[1:]), num_classes)
+        return keras.models.load_model(latest_checkpoint)
+    print("Creating a new model of kind ", model_kind)
+    model = keras.Sequential()
+    if model_kind == "nasnetmobile":
+        model = NasnetModel((X['input_1'].shape[1:], X['input_2'].shape[1:]), num_classes)
+    elif model_kind == "basic_cnn":
+        layers = 3
+        filters = 32
+        dropout = 0.3
+        input_1 = keras.Input(shape=X['input_1'].shape[1:], name="input_1")
+        x = input_1
+        for i in range(1, layers+1):
+            x = dilated_cnn_block(x, filters, X['input_1'].shape[1:], i, dropout)
+        x = keras.layers.GlobalAveragePooling2D()(x)
+        flat = keras.layers.Flatten()(x)
+        input_2 = keras.Input(shape=X['input_2'].shape[1:], name="input_2")
+        concatenatedFeatures = keras.layers.Concatenate(axis = 1)([flat, input_2])
+        dense = keras.layers.Dense(512)(concatenatedFeatures)
+        outputs = keras.layers.Dense(num_classes, activation=keras.activations.softmax)(dense)
+        model = keras.Model(inputs=[input_1, input_2], outputs=outputs, name="nasnet_model")
+        
     model.compile(
-        loss=tf.keras.losses.CategoricalCrossentropy(),
-        optimizer=tf.keras.optimizers.Adam(),
-        metrics=["accuracy", tf.keras.metrics.CategoricalAccuracy(), tf.keras.metrics.PrecisionAtRecall(0.8)],#, "precision", "recall"],
+        loss=keras.losses.CategoricalCrossentropy(),
+        optimizer=keras.optimizers.Adam(),
+        metrics=["accuracy", keras.metrics.CategoricalAccuracy(), keras.metrics.PrecisionAtRecall(0.8)],#, "precision", "recall"],
     )
-
     return model 
 
-
+    
+    
 if __name__ == '__main__':
   app.run(main)
 
