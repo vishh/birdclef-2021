@@ -1,5 +1,9 @@
 absl-py
 tensorflow
+tensorflow_transform
 pandas
 numpy
 scikit-learn
+argparse
+librosa
+#sudo apt-get install libsndfile1
