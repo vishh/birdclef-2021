@@ -71,7 +71,7 @@ class SimpleFeatureExtraction(beam.PTransform):
         S_db = librosa.power_to_db(S, ref=np.max)
         for w in range(S_db.shape[1]):
           if S_db[:, w].shape[0] > 0:
-            return {'audio': S_db[:, w][0], 'latitude': elem[2], 'longitude': elem[3], 'month': elem[4], 'label': elem[5]}
+            return {'audio': S_db[:, w], 'latitude': elem[2], 'longitude': elem[3], 'month': elem[4], 'label': elem[5]}
           
     def print_fn(self, elem):
       print(type(elem))
@@ -142,7 +142,7 @@ def run_pipeline(work_dir, beam_options, test_percent, val_percent):
     # Apply the tf.Transform preprocessing_fn
     input_metadata = dataset_metadata.DatasetMetadata(
       schema_utils.schema_from_feature_spec({
-        'audio': tf.io.FixedLenFeature([], tf.float32),
+        'audio': tf.io.FixedLenFeature([128], tf.float32),
         'latitude': tf.io.FixedLenFeature([], tf.float32),
         'longitude': tf.io.FixedLenFeature([], tf.float32),
         'month': tf.io.FixedLenFeature([], tf.int64),
