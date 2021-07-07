@@ -17,6 +17,7 @@ Adjust `--batch_size` based on the number of GPUs and memory available.
 
 TODO:
 
+1. (In Progress) Create a TF Transform pipeline to convert the audio samples into 2 minute chunks with background noise removed and stored as TF Records in GCS - `transform.py`
 1. Add non birdcall sounds to the dataset to have the model learn to identify birdcalls in addition to classifying them.
 1. Evaluate a few popular CNN architectures and publish evaluation metrics. Started with NasNetMobile
 1. Generate new samples with raw audio data, possibly with some prefiltering to reduce background noise. Then attempt to learn directly using dialated CNSs.
