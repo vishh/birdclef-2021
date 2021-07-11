@@ -16,7 +16,6 @@ from tensorflow_transform.tf_metadata import dataset_metadata
 from tensorflow_transform.tf_metadata import schema_utils
 from tensorflow_transform.coders import example_proto_coder
 
-
 import apache_beam as beam
 from apache_beam.io import filebasedsource
 from apache_beam.io import tfrecordio
@@ -32,46 +31,83 @@ class SimpleFeatureExtraction(beam.PTransform):
   full-pass of the data (such as feature scaling) has to be done with
   tf.Transform.
   """
-    def __init__(self, dir):
-      super(SimpleFeatureExtraction, self).__init__()
-      self.metadata = os.path.join(dir, "train_metadata.csv")
+    def __init__(self, dir, metadata_file):
+      beam.PTransform.__init__(self)
+      self.metadata = os.path.join(dir, metadata_file)
       self.train_data_dir = os.path.join(dir, "train_short_audio")
       
     def parse_file(self, element):
+    #,primary_label,secondary_labels,type,latitude,longitude,scientific_name,common_name,author,date,filename,license,rating,time,url,duration,pos,neg
       for line in csv.reader([element], quotechar='"', delimiter=',', quoting=csv.QUOTE_ALL, skipinitialspace=True):
-        if float(line[-3]) >= 2.5:
+        line = line[1:]
+        if float(line[11]) >= 2.5:
           label = line[0]
           latitude = float(line[3])
           longitude = float(line[4])
           month = int(line[8].split("-")[1])
           f = line[9]
-          return [[f, latitude, longitude, month, label]]
+          pos, neg = [], []
+          if len(line) > 14:
+              pos = line[-2].split(",")
+              neg = line[-1].split(",")
+          return [[f, pos, neg, latitude, longitude, month,  label]]
 
+    def get_audio_data(self, f):
+        with tf.io.gfile.GFile(f, 'rb') as fp:
+            x, sr = librosa.load(fp, sr=32000, mono=True)
+        return x
+    
     def load_audio(self, elem):
-      filepath = os.path.join(self.train_data_dir, elem[-1], elem[0])
-      with tf.io.gfile.GFile(filepath, 'rb') as fp:
-        x, sr = librosa.load(fp, sr=32000, mono=True)
-        return [x, sr]+elem[1:]
+        filepath = os.path.join(self.train_data_dir, elem[-1], elem[0])
+        pos, neg = None, None
+        x = self.get_audio_data(filepath)
+        for f in elem[1]:
+            data = self.get_audio_data(os.path.join(self.train_data_dir, f))
+            if pos is None:
+                pos = data
+            else:
+                pos = np.append(pos, data)
+    
+        for f in elem[2]:
+            data = self.get_audio_data(os.path.join(self.train_data_dir, f))
+            if neg is None:
+                neg = data
+            else:
+                neg = np.append(neg, data)
 
-    def mel_spec(self, elem):
-      sr = elem[1]
-      melspectrogram_parameters = {
-        "n_mels": 128,
-        "fmin": 150,
-        "fmax": 15000,
-        "hop_length": sr, # one second
-        "win_length" : 2*sr, # 2 seconds resulting in 50% overlap
-        "n_fft": 2*sr,
-      }
-      
-      sos = signal.butter(10, [150,15000], 'bandpass', fs=sr, output='sos')
-      x = signal.sosfilt(sos, elem[0])
-      if len(x) >= 2*sr:
-        S = librosa.feature.melspectrogram(x, sr=sr,  **melspectrogram_parameters)
-        S_db = librosa.power_to_db(S, ref=np.max)
-        for w in range(S_db.shape[1]):
-          if S_db[:, w].shape[0] > 0:
-            return {'audio': S_db[:, w], 'latitude': elem[2], 'longitude': elem[3], 'month': elem[4], 'label': elem[5]}
+        return [x, pos, neg]+elem[3:]
+    
+    def get_mel_batches(self, data, sr=32000):
+        melspectrogram_parameters = {
+            "n_mels": 128,
+            "fmin": 150,
+            "fmax": 15000,
+            "hop_length": sr, # one second
+            "win_length" : 2*sr, # 2 seconds resulting in 50% overlap
+            "n_fft": 2*sr,
+        }
+
+        sos = signal.butter(10, [150,15000], 'bandpass', fs=sr, output='sos')
+        x = signal.sosfilt(sos, data)
+        S_db = []
+        if len(x) >= 2*sr:
+            S = librosa.feature.melspectrogram(x, sr=sr,  **melspectrogram_parameters)
+            S_db = librosa.power_to_db(S, ref=np.max)
+        return S_db
+
+    def mel_spec(self, elem, sr=32000):
+      anchor = self.get_mel_batches(elem[0])
+      pos = self.get_mel_batches(elem[1])
+      neg = self.get_mel_batches(elem[2])
+      for w in range(anchor.shape[1]):
+          if anchor[:, w].shape[0] > 0 and pos[:, w].shape[0] >0 and neg[:, w].shape[0] > 0:
+            return {'anchor': anchor[:, w],
+                    'pos': pos[:, w],
+                    'neg': neg[:, w],
+                    'latitude': elem[3],
+                    'longitude': elem[4],
+                    'month': elem[5],
+                    'label': elem[6]}
           
     def print_fn(self, elem):
       print(type(elem))
@@ -83,7 +119,7 @@ class SimpleFeatureExtraction(beam.PTransform):
               | 'Parse file' >> beam.FlatMap(self.parse_file)
               | 'Load Audio' >> beam.Map(self.load_audio)
               | 'Get MelSpec' >> beam.Map(self.mel_spec)
-#              | 'Print' >> beam.Map(self.print_fn)
+#              | 'Print' >> beam.Map(print)
       )
       # [END dataflow_simple_feature_extraction]
 
@@ -102,19 +138,20 @@ def normalize_inputs(inputs):
   Any transformation done in tf.Transform will be embedded into the TensorFlow
   model itself.
   """
-    if inputs is not None:
-      label_integerized = tft.compute_and_apply_vocabulary(inputs['label'])
-      return {
+    label_integerized = tft.compute_and_apply_vocabulary(inputs['label'])
+    return {
         # Scale the input features for normalization
-        'audio_normalized': tft.scale_to_0_1(inputs['audio']),
+        'anchor_normalized': tft.scale_to_0_1(inputs['anchor']),
+        'pos_normalized': tft.scale_to_0_1(inputs['pos']),
+        'neg_normalized': tft.scale_to_0_1(inputs['neg']),
         'latitude_normalized': tft.scale_to_0_1(inputs['latitude']),
         'longitude_normalized': tft.scale_to_0_1(inputs['longitude']),
         'month_normalized': tft.scale_to_0_1(inputs['month']),
         'label_integerized': label_integerized
-      }
+    }
   # [END dataflow_normalize_inputs]
 
-def run_pipeline(work_dir, beam_options, test_percent, val_percent):
+def run_pipeline(work_dir, metadata_file, beam_options, test_percent, val_percent):
   data_files_dir = os.path.join(work_dir, 'data')
   tft_temp_dir = os.path.join(work_dir, 'tft-temp')
   labels_dir = os.path.join(work_dir, 'labels')
@@ -133,7 +170,7 @@ def run_pipeline(work_dir, beam_options, test_percent, val_percent):
     # Transform and validate the input data matches the input schema
     dataset = (
       p
-      | 'Feature extraction' >> SimpleFeatureExtraction(data_files_dir)
+      | 'Feature extraction' >> SimpleFeatureExtraction(data_files_dir, metadata_file)
       # [END dataflow_feature_extraction]
       )
     # [END dataflow_validate_inputs]
@@ -142,11 +179,13 @@ def run_pipeline(work_dir, beam_options, test_percent, val_percent):
     # Apply the tf.Transform preprocessing_fn
     input_metadata = dataset_metadata.DatasetMetadata(
       schema_utils.schema_from_feature_spec({
-        'audio': tf.io.FixedLenFeature([128], tf.float32),
-        'latitude': tf.io.FixedLenFeature([], tf.float32),
-        'longitude': tf.io.FixedLenFeature([], tf.float32),
-        'month': tf.io.FixedLenFeature([], tf.int64),
-        'label': tf.io.FixedLenFeature([], tf.string),
+          'anchor': tf.io.FixedLenFeature([128], tf.float32),
+          'pos': tf.io.FixedLenFeature([128], tf.float32),
+          'neg': tf.io.FixedLenFeature([128], tf.float32),
+          'latitude': tf.io.FixedLenFeature([], tf.float32),
+          'longitude': tf.io.FixedLenFeature([], tf.float32),
+          'month': tf.io.FixedLenFeature([], tf.int64),
+          'label': tf.io.FixedLenFeature([], tf.string),
       }))
 
     dataset_and_metadata, transform_fn = (
@@ -216,10 +255,16 @@ if __name__ == '__main__':
     '--val-percent',
     required=True,
     help='Percentage of samples to set aside for val set')
-
+  parser.add_argument(
+      '--metadata-file',
+      required=False,
+      default="train_metadata.csv",
+      help='Metadata file to use.'
+  )
+  
   args, pipeline_args = parser.parse_known_args()
   work_dir = args.work_dir
 
   beam_options = PipelineOptions(pipeline_args, save_main_session=True)
 
-  run_pipeline(work_dir, beam_options, float(args.test_percent), float(args.val_percent))
+  run_pipeline(work_dir, args.metadata_file, beam_options, float(args.test_percent), float(args.val_percent))
