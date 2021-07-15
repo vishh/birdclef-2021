@@ -40,7 +40,7 @@ class SimpleFeatureExtraction(beam.PTransform):
     #,primary_label,secondary_labels,type,latitude,longitude,scientific_name,common_name,author,date,filename,license,rating,time,url,duration,pos,neg
       for line in csv.reader([element], quotechar='"', delimiter=',', quoting=csv.QUOTE_ALL, skipinitialspace=True):
         line = line[1:]
-        if float(line[11]) >= 2.5:
+        if float(line[11]) >= 3.5:
           label = line[0]
           latitude = float(line[3])
           longitude = float(line[4])
@@ -75,51 +75,69 @@ class SimpleFeatureExtraction(beam.PTransform):
             else:
                 neg = np.append(neg, data)
 
-        return [x, pos, neg]+elem[3:]
-    
-    def get_mel_batches(self, data, sr=32000):
+        return [[x, pos, neg]+elem[3:]]
+
+    def remove_silence(self, elem, sr=32000):
+        data = [elem[0], elem[1], elem[2]]
+        for idx, d in enumerate(data):
+            intervals = librosa.effects.split(d, top_db=20)
+            non_silent_audio = []
+            for start, end in intervals:
+                non_silent_audio += d[start:end].tolist()
+            data[idx] = np.array(non_silent_audio)
+        min_length = np.min([len(d) for d in data])
+        data = [d[:min_length] for d in data]
+        return [data + elem[3:]]
+        
+    def split_data(self, elem, sr=32000):
+        output = []
+        windows = int((len(elem[0]) - 2*sr)/sr + 1)
+        for w in range(windows):
+            start = w * sr
+            end = start + 2*sr
+            output.append([
+                elem[0][start:end],
+                elem[1][start:end],
+                elem[2][start:end],
+                ] + elem[3:]
+            )
+        return output
+        
+    def get_mel_batches(self, x, sr=32000):
         melspectrogram_parameters = {
             "n_mels": 128,
-            "fmin": 150,
-            "fmax": 15000,
-            "hop_length": sr, # one second
-            "win_length" : 2*sr, # 2 seconds resulting in 50% overlap
-            "n_fft": 2*sr,
+            "fmin": 500,
+            "fmax": 10000,
         }
-
-        sos = signal.butter(10, [150,15000], 'bandpass', fs=sr, output='sos')
-        x = signal.sosfilt(sos, data)
         S_db = []
         if len(x) >= 2*sr:
-            S = librosa.feature.melspectrogram(x, sr=sr,  **melspectrogram_parameters)
+            S = librosa.feature.melspectrogram(x, sr=sr, **melspectrogram_parameters)
             S_db = librosa.power_to_db(S, ref=np.max)
+            S_db = np.transpose(S_db)
         return S_db
 
     def mel_spec(self, elem, sr=32000):
-      anchor = self.get_mel_batches(elem[0])
-      pos = self.get_mel_batches(elem[1])
-      neg = self.get_mel_batches(elem[2])
-      for w in range(anchor.shape[1]):
-          if anchor[:, w].shape[0] > 0 and pos[:, w].shape[0] >0 and neg[:, w].shape[0] > 0:
-            return {'anchor': anchor[:, w],
-                    'pos': pos[:, w],
-                    'neg': neg[:, w],
-                    'latitude': elem[3],
-                    'longitude': elem[4],
-                    'month': elem[5],
-                    'label': elem[6]}
-          
-    def print_fn(self, elem):
-      print(type(elem))
-      return elem
-    
+        anchor = self.get_mel_batches(elem[0])
+        pos = self.get_mel_batches(elem[1])
+        neg = self.get_mel_batches(elem[2])
+        return [{
+            'anchor': anchor,
+            'pos': pos,
+            'neg': neg,
+            'latitude': elem[3],
+            'longitude': elem[4],
+            'month': elem[5],
+            'label': elem[6],
+        }]
+              
     def expand(self, p):
       return (p
               | 'Read input file' >> beam.io.ReadFromText(self.metadata, skip_header_lines=1)
               | 'Parse file' >> beam.FlatMap(self.parse_file)
-              | 'Load Audio' >> beam.Map(self.load_audio)
-              | 'Get MelSpec' >> beam.Map(self.mel_spec)
-#              | 'Print' >> beam.Map(print)
+              | 'Load Audio' >> beam.FlatMap(self.load_audio)
+              | 'Remove Silence' >> beam.FlatMap(self.remove_silence)
+              | 'Split Audio' >> beam.FlatMap(self.split_data)
+              | 'Get MelSpec' >> beam.FlatMap(self.mel_spec)
       )
       # [END dataflow_simple_feature_extraction]
 
@@ -173,15 +191,15 @@ def run_pipeline(work_dir, metadata_file, beam_options, test_percent, val_percen
       | 'Feature extraction' >> SimpleFeatureExtraction(data_files_dir, metadata_file)
       # [END dataflow_feature_extraction]
       )
+    
     # [END dataflow_validate_inputs]
- 
     # [START dataflow_molecules_analyze_and_transform_dataset]
     # Apply the tf.Transform preprocessing_fn
     input_metadata = dataset_metadata.DatasetMetadata(
       schema_utils.schema_from_feature_spec({
-          'anchor': tf.io.FixedLenFeature([128], tf.float32),
-          'pos': tf.io.FixedLenFeature([128], tf.float32),
-          'neg': tf.io.FixedLenFeature([128], tf.float32),
+          'anchor': tf.io.FixedLenFeature([126, 128], tf.float32),
+          'pos': tf.io.FixedLenFeature([126, 128], tf.float32),
+          'neg': tf.io.FixedLenFeature([126, 128], tf.float32),
           'latitude': tf.io.FixedLenFeature([], tf.float32),
           'longitude': tf.io.FixedLenFeature([], tf.float32),
           'month': tf.io.FixedLenFeature([], tf.int64),
