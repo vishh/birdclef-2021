@@ -159,13 +159,13 @@ class ASTModel(nn.Module):
         return f_dim, t_dim
 
     @autocast()
-    def forward(self, x):
+    def forward(self, ip):
         """
         :param x: the input spectrogram, expected shape: (batch_size, time_frame_num, frequency_bins), e.g., (12, 1024, 128)
         :return: prediction
         """
         # expect input x = (batch_size, time_frame_num, frequency_bins), e.g., (12, 1024, 128)
-        x = x.unsqueeze(1)
+        x = ip.unsqueeze(1)
         x = x.transpose(2, 3)
 
         B = x.shape[0]

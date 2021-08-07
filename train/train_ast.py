@@ -60,20 +60,23 @@ def train(audio_model, train_loader, test_loader, args):
                 time.time() - start_time])
         with open("%s/progress.pkl" % exp_dir, "wb") as f:
             pickle.dump(progress, f)
+    loss_fn = nn.CrossEntropyLoss()
+    device_ids=[*range(torch.cuda.device_count())]
 
-    if not isinstance(audio_model, nn.DataParallel):
-        audio_model = nn.DataParallel(audio_model, device_ids = np.arange(torch.cuda.device_count()))
-    audio_model.to(device)
-        
+    args.labels_dim = audio_model.label_dim
+    model_with_loss = nn.DataParallel(ModelWithLoss(audio_model, loss_fn), device_ids=device_ids)
+    model_with_loss.cuda(0)
+    print(model_with_loss.device_ids, model_with_loss.output_device, model_with_loss.src_device_obj)
+
     # Set up the optimizer
-    trainables = [p for p in audio_model.parameters() if p.requires_grad]
+    trainables = [p for p in model_with_loss.parameters() if p.requires_grad]
     print('Total parameter number is : {:.3f} million'.format(sum(p.numel() for p in audio_model.parameters()) / 1e6))
     print('Total trainable parameter number is : {:.3f} million'.format(sum(p.numel() for p in trainables) / 1e6))
     optimizer = torch.optim.Adam(trainables, args.lr, weight_decay=5e-7, betas=(0.95, 0.999))
+#    optimizer = torch.optim.SGD(trainables, args.lr)
 
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, list(range(5,26)), gamma=0.85)
     main_metrics = 'acc'
-    loss_fn = nn.CrossEntropyLoss()
     warmup = False
     print('now training with  main metrics: {:s}, loss function: {:s}, learning rate scheduler: {:s}'.format(str(main_metrics), str(loss_fn), str(scheduler)))
     args.loss_fn = loss_fn
@@ -85,12 +88,12 @@ def train(audio_model, train_loader, test_loader, args):
     print("current #steps=%s, #epochs=%s" % (global_step, epoch))
     print("start training...")
     result = np.zeros([args.n_epochs, 10])
-    audio_model.train()
+    model_with_loss.train()
     train_len = -1
     while epoch < args.n_epochs + 1:
         begin_time = time.time()
         end_time = time.time()
-        audio_model.train()
+        model_with_loss.train()
         print('---------------')
         print(datetime.datetime.now())
         print("current #epochs=%s, #steps=%s" % (epoch, global_step))
@@ -99,8 +102,8 @@ def train(audio_model, train_loader, test_loader, args):
             audio_input = torch.Tensor(audio_input_dict['audio_normalized'].numpy())
             labels = torch.Tensor(labels.numpy())
             B = audio_input.size(0)
-            audio_input = audio_input.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+#            audio_input = audio_input.cuda(device_ids[0])#to(device, non_blocking=True)
+#            labels = labels.cuda(device_ids[0]) #to(device, non_blocking=True)
 
             data_time.update(time.time() - end_time)
             per_sample_data_time.update((time.time() - end_time) / audio_input.shape[0])
@@ -114,16 +117,12 @@ def train(audio_model, train_loader, test_loader, args):
                 print('warm-up learning rate is {:f}'.format(optimizer.param_groups[0]['lr']))
 
             with autocast():
-                audio_output = audio_model(audio_input)
-                if isinstance(loss_fn, torch.nn.CrossEntropyLoss):
-                    loss = loss_fn(audio_output, torch.argmax(labels.long(), axis=1))
-                else:
-                    loss = loss_fn(audio_output, labels)
-
+                loss, audio_output = model_with_loss(labels.long(), audio_input)
+                loss = loss.sum()
             # optimization if amp is not used
-            # optimizer.zero_grad()
-            # loss.backward()
-            # optimizer.step()
+            #optimizer.zero_grad()
+            #loss.backward()
+            #optimizer.step()
 
             # optimiztion if amp is used
             optimizer.zero_grad()
@@ -155,13 +154,12 @@ def train(audio_model, train_loader, test_loader, args):
 
             end_time = time.time()
             global_step += 1
-
-
+        
         if train_len < 0:
             train_len = global_step * args.batch_size
 
         print('start validation')
-        stats, valid_loss = validate(audio_model, test_loader, args, epoch)
+        stats, valid_loss = validate(model_with_loss, device_ids, test_loader, args, epoch)
 
         # ensemble results
         cum_stats = validate_ensemble(args, epoch)
@@ -239,15 +237,12 @@ def train(audio_model, train_loader, test_loader, args):
         per_sample_dnn_time.reset()
 
 
-def validate(audio_model, val_loader, args, epoch):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def validate(audio_model, device_ids, val_loader, args, epoch):
     batch_time = AverageMeter()
     if not isinstance(audio_model, nn.DataParallel):
         if torch.cuda.is_available():
-            audio_model = nn.DataParallel(audio_model, device_ids = np.arange(torch.cuda.device_count()))
-        else:
-            audio_model = nn.DataParallel(audio_model)
-    audio_model = audio_model.to(device)
+            audio_model = nn.DataParallel(audio_model, device_ids = device_ids)
+    audio_model = audio_model.to(device_ids[0])
 
     # switch to evaluate mode
     audio_model.eval()
@@ -261,23 +256,17 @@ def validate(audio_model, val_loader, args, epoch):
             audio_input = torch.Tensor(audio_input_dict['audio_normalized'].numpy())
             labels = torch.Tensor(labels.numpy())
 
-            audio_input = audio_input.to(device)
-
             # compute output
-            audio_output = audio_model(audio_input)
+            loss, audio_output = audio_model(labels.long(), audio_input)
+            loss = loss.sum()
             audio_output = torch.sigmoid(audio_output)
             predictions = audio_output.to('cpu').detach().squeeze()
 
             A_predictions.append(predictions)
-            labels_onehot = F.one_hot(labels.to(torch.int64), num_classes=audio_model.module.label_dim)
+            labels_onehot = F.one_hot(labels.to(torch.int64), num_classes=args.labels_dim)
             A_targets.append(labels_onehot.squeeze())
 
             # compute the loss
-            labels = labels.to(device)
-            if isinstance(args.loss_fn, torch.nn.CrossEntropyLoss):
-                loss = args.loss_fn(audio_output, torch.argmax(labels.long(), axis=1))
-            else:
-                loss = args.loss_fn(audio_output, labels)
             A_loss.append(loss.to('cpu').detach())
 
             batch_time.update(time.time() - end)
@@ -316,7 +305,7 @@ def validate_ensemble(args, epoch):
     return stats
 
 def validate_wa(audio_model, val_loader, args, start_epoch, end_epoch):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     exp_dir = args.exp_dir
 
     sdA = torch.load(exp_dir + '/models/audio_model.' + str(start_epoch) + '.pth', map_location=device)
@@ -339,10 +328,21 @@ def validate_wa(audio_model, val_loader, args, start_epoch, end_epoch):
     audio_model.load_state_dict(sdA)
 
     torch.save(audio_model.state_dict(), exp_dir + '/models/audio_model_wa.pth')
-
-    stats, loss = validate(audio_model, val_loader, args, 'wa')
+    device_ids = [*range(torch.cuda.device_cound())]
+    stats, loss = validate(audio_model, device_ids, val_loader, args, 'wa')
     return stats
 
+class ModelWithLoss(nn.Module):
+    def __init__(self, model, loss):
+        super().__init__()
+        self.model = model
+        self.loss = loss
+        
+    def forward(self, targets, *inputs):
+        outputs = self.model(*inputs)
+        loss = self.loss(outputs, targets.squeeze())
+        return torch.unsqueeze(loss,0),outputs
+    
 def main():
     args = parser.parse_args()
     train_dataset, val_dataset, test_dataset = get_data(args.data_path, args.batch_size, args.cache_dir, args.data_percent)
