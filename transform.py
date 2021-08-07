@@ -19,6 +19,7 @@ from tensorflow_transform.coders import example_proto_coder
 import apache_beam as beam
 from apache_beam.io import filebasedsource
 from apache_beam.io import tfrecordio
+from apache_beam.io import WriteToText
 from apache_beam.options.pipeline_options import PipelineOptions
 
 # [START dataflow_molecules_simple_feature_extraction]
@@ -37,20 +38,15 @@ class SimpleFeatureExtraction(beam.PTransform):
       self.train_data_dir = os.path.join(dir, "train_short_audio")
       
     def parse_file(self, element):
-    #,primary_label,secondary_labels,type,latitude,longitude,scientific_name,common_name,author,date,filename,license,rating,time,url,duration,pos,neg
-      for line in csv.reader([element], quotechar='"', delimiter=',', quoting=csv.QUOTE_ALL, skipinitialspace=True):
-        line = line[1:]
-        if float(line[11]) >= 3.5:
-          label = line[0]
-          latitude = float(line[3])
-          longitude = float(line[4])
-          month = int(line[8].split("-")[1])
-          f = line[9]
-          pos, neg = [], []
-          if len(line) > 14:
-              pos = line[-2].split(",")
-              neg = line[-1].split(",")
-          return [[f, pos, neg, latitude, longitude, month,  label]]
+        #primary_label,secondary_labels,type,latitude,longitude,scientific_name,common_name,author,date,filename,license,rating,time,url
+        for line in csv.reader([element], quotechar='"', delimiter=',', quoting=csv.QUOTE_ALL, skipinitialspace=True):
+            if float(line[11]) >= 3.5:
+                label = line[0]
+                latitude = float(line[3])
+                longitude = float(line[4])
+                month = int(line[8].split("-")[1])
+                f = line[9]
+                return [[f, latitude, longitude, month,  label]]
 
     def get_audio_data(self, f):
         with tf.io.gfile.GFile(f, 'rb') as fp:
@@ -59,48 +55,39 @@ class SimpleFeatureExtraction(beam.PTransform):
     
     def load_audio(self, elem):
         filepath = os.path.join(self.train_data_dir, elem[-1], elem[0])
-        pos, neg = None, None
         x = self.get_audio_data(filepath)
-        for f in elem[1]:
-            data = self.get_audio_data(os.path.join(self.train_data_dir, f))
-            if pos is None:
-                pos = data
-            else:
-                pos = np.append(pos, data)
-    
-        for f in elem[2]:
-            data = self.get_audio_data(os.path.join(self.train_data_dir, f))
-            if neg is None:
-                neg = data
-            else:
-                neg = np.append(neg, data)
-
-        return [[x, pos, neg]+elem[3:]]
+        return [[x]+elem[1:]]
 
     def remove_silence(self, elem, sr=32000):
-        data = [elem[0], elem[1], elem[2]]
-        for idx, d in enumerate(data):
-            intervals = librosa.effects.split(d, top_db=20)
-            non_silent_audio = []
-            for start, end in intervals:
-                non_silent_audio += d[start:end].tolist()
-            data[idx] = np.array(non_silent_audio)
-        min_length = np.min([len(d) for d in data])
-        data = [d[:min_length] for d in data]
-        return [data + elem[3:]]
+        data = elem[0]
+        intervals = librosa.effects.split(data, top_db=20)
+        non_silent_audio = []
+        silent_audio = []
+        prev_end = 0
+        for start, end in intervals:
+            non_silent_audio += data[start:end].tolist()
+            if start > prev_end and len(silent_audio) == 0:
+                silent_audio == data[prev_end:start].tolist()
+            prev_end = end
+        if prev_end < len(data):
+            silent_audio += data[prev_end:].tolist()
+        if len(silent_audio) > 5*sr:
+            silent_audio = silent_audio[:sr*5]
+        return [[non_silent_audio] + [silent_audio] + elem[1:]]
         
     def split_data(self, elem, sr=32000):
         output = []
-        windows = int((len(elem[0]) - 2*sr)/sr + 1)
+        windows = int((len(elem[0]) - 5*sr)/sr + 1)
         for w in range(windows):
             start = w * sr
-            end = start + 2*sr
-            output.append([
-                elem[0][start:end],
-                elem[1][start:end],
-                elem[2][start:end],
-                ] + elem[3:]
-            )
+            end = start + 5*sr
+            output.append([np.array(elem[0][start:end])] + elem[2:])
+        silent_windows = int((len(elem[1]) - 5*sr)/sr + 1)
+        for w in range(silent_windows):
+            start = w * sr
+            end = start + 5*sr
+            output.append([np.array(elem[1][start:end])] + elem[2:-1] + ["nocall"])
+
         return output
         
     def get_mel_batches(self, x, sr=32000):
@@ -108,26 +95,24 @@ class SimpleFeatureExtraction(beam.PTransform):
             "n_mels": 128,
             "fmin": 500,
             "fmax": 10000,
+            "hop_length": int(0.01*sr),
+            "win_length": int(0.025*sr)
         }
         S_db = []
-        if len(x) >= 2*sr:
-            S = librosa.feature.melspectrogram(x, sr=sr, **melspectrogram_parameters)
+        if len(x) >= 5*sr:
+            S = librosa.feature.melspectrogram(x, sr=sr, window=signal.windows.hamming, **melspectrogram_parameters)
             S_db = librosa.power_to_db(S, ref=np.max)
             S_db = np.transpose(S_db)
         return S_db
 
     def mel_spec(self, elem, sr=32000):
-        anchor = self.get_mel_batches(elem[0])
-        pos = self.get_mel_batches(elem[1])
-        neg = self.get_mel_batches(elem[2])
+        audio = self.get_mel_batches(elem[0])
         return [{
-            'anchor': anchor,
-            'pos': pos,
-            'neg': neg,
-            'latitude': elem[3],
-            'longitude': elem[4],
-            'month': elem[5],
-            'label': elem[6],
+            'audio': audio,
+            'latitude': elem[1],
+            'longitude': elem[2],
+            'month': elem[3],
+            'label': elem[4],
         }]
               
     def expand(self, p):
@@ -138,30 +123,31 @@ class SimpleFeatureExtraction(beam.PTransform):
               | 'Remove Silence' >> beam.FlatMap(self.remove_silence)
               | 'Split Audio' >> beam.FlatMap(self.split_data)
               | 'Get MelSpec' >> beam.FlatMap(self.mel_spec)
+
       )
       # [END dataflow_simple_feature_extraction]
 
 # [START dataflow_normalize_inputs]
 def normalize_inputs(inputs):
     """Preprocessing function for tf.Transform (full-pass transformations).
-  Here we will do any preprocessing that requires a full-pass of the dataset.
-  It takes as inputs the preprocessed data from the `PTransform` we specify, in
-  this case `SimpleFeatureExtraction`.
-  Common operations might be scaling values to 0-1, getting the minimum or
-  maximum value of a certain field, creating a vocabulary for a string field.
-  There are two main types of transformations supported by tf.Transform, for
-  more information, check the following modules:
+    Here we will do any preprocessing that requires a full-pass of the dataset.
+    It takes as inputs the preprocessed data from the `PTransform` we specify, in
+    this case `SimpleFeatureExtraction`.
+    Common operations might be scaling values to 0-1, getting the minimum or
+    maximum value of a certain field, creating a vocabulary for a string field.
+    There are two main types of transformations supported by tf.Transform, for
+    more information, check the following modules:
     - analyzers: tensorflow_transform.analyzers.py
     - mappers:   tensorflow_transform.mappers.py
-  Any transformation done in tf.Transform will be embedded into the TensorFlow
-  model itself.
-  """
+    Any transformation done in tf.Transform will be embedded into the TensorFlow
+    model itself.
+    """
     label_integerized = tft.compute_and_apply_vocabulary(inputs['label'])
+    audio = inputs['audio']
+    audio_normalized = tft.scale_to_z_score(audio)/2
     return {
         # Scale the input features for normalization
-        'anchor_normalized': tft.scale_to_0_1(inputs['anchor']),
-        'pos_normalized': tft.scale_to_0_1(inputs['pos']),
-        'neg_normalized': tft.scale_to_0_1(inputs['neg']),
+        'audio_normalized': audio_normalized,
         'latitude_normalized': tft.scale_to_0_1(inputs['latitude']),
         'longitude_normalized': tft.scale_to_0_1(inputs['longitude']),
         'month_normalized': tft.scale_to_0_1(inputs['month']),
@@ -169,7 +155,7 @@ def normalize_inputs(inputs):
     }
   # [END dataflow_normalize_inputs]
 
-def run_pipeline(work_dir, metadata_file, beam_options, test_percent, val_percent):
+def run_pipeline(work_dir, metadata_file, beam_options, test_percent, val_percent, max_entries_per_class):
   data_files_dir = os.path.join(work_dir, 'data')
   tft_temp_dir = os.path.join(work_dir, 'tft-temp')
   labels_dir = os.path.join(work_dir, 'labels')
@@ -179,7 +165,7 @@ def run_pipeline(work_dir, metadata_file, beam_options, test_percent, val_percen
   transform_fn_dir = os.path.join(work_dir, transform_fn_io.TRANSFORM_FN_DIR)
   if tf.io.gfile.exists(transform_fn_dir):
     tf.io.gfile.rmtree(transform_fn_dir)
-    
+
     # [START dataflow_create_pipeline]
     # Build and run a Beam Pipeline
   with beam.Pipeline(options=beam_options) as p, \
@@ -191,15 +177,29 @@ def run_pipeline(work_dir, metadata_file, beam_options, test_percent, val_percen
       | 'Feature extraction' >> SimpleFeatureExtraction(data_files_dir, metadata_file)
       # [END dataflow_feature_extraction]
       )
+
+    filtered_dataset = (
+        dataset
+        | 'key by label' >> beam.FlatMap(lambda elem: [(elem['label'], elem)])
+        | 'sample to downsample' >> beam.combiners.Sample.FixedSizePerKey(max_entries_per_class)
+        | 'Values' >> beam.FlatMap(lambda elem: elem[1])
+    )
+
+    label_distribution_dir_prefix = os.path.join(work_dir, 'labels_count', 'part')
+    label_counts = (
+        filtered_dataset
+        | 'collect labels' >> beam.FlatMap(lambda elem: [elem['label']])
+        | 'count unique labels' >> beam.combiners.Count.PerElement()
+        | 'format' >> beam.FlatMap(lambda elem: ['%s:%s'% (elem[0], elem[1])])
+        | 'write' >> WriteToText(label_distribution_dir_prefix)
+        )
     
     # [END dataflow_validate_inputs]
     # [START dataflow_molecules_analyze_and_transform_dataset]
     # Apply the tf.Transform preprocessing_fn
     input_metadata = dataset_metadata.DatasetMetadata(
       schema_utils.schema_from_feature_spec({
-          'anchor': tf.io.FixedLenFeature([126, 128], tf.float32),
-          'pos': tf.io.FixedLenFeature([126, 128], tf.float32),
-          'neg': tf.io.FixedLenFeature([126, 128], tf.float32),
+          'audio': tf.io.FixedLenFeature([501, 128], tf.float32),
           'latitude': tf.io.FixedLenFeature([], tf.float32),
           'longitude': tf.io.FixedLenFeature([], tf.float32),
           'month': tf.io.FixedLenFeature([], tf.int64),
@@ -207,7 +207,7 @@ def run_pipeline(work_dir, metadata_file, beam_options, test_percent, val_percen
       }))
 
     dataset_and_metadata, transform_fn = (
-      (dataset, input_metadata)
+      (filtered_dataset, input_metadata)
       | 'Feature scaling' >> beam_impl.AnalyzeAndTransformDataset(normalize_inputs)
     )
     dataset, metadata = dataset_and_metadata
@@ -235,19 +235,19 @@ def run_pipeline(work_dir, metadata_file, beam_options, test_percent, val_percen
     _ = (
       train_dataset
       | 'Write train dataset' >> tfrecordio.WriteToTFRecord(
-        train_dataset_prefix, coder))
+          train_dataset_prefix, coder, file_name_suffix=".tfrecords"))
     
     val_dataset_prefix = os.path.join(val_dataset_dir, 'part')
     _ = (
       val_dataset
       | 'Write val dataset' >> tfrecordio.WriteToTFRecord(
-        val_dataset_prefix, coder))
+          val_dataset_prefix, coder, file_name_suffix=".tfrecords"))
 
     test_dataset_prefix = os.path.join(test_dataset_dir, 'part')
     _ = (
       test_dataset
       | 'Write test dataset' >> tfrecordio.WriteToTFRecord(
-        test_dataset_prefix, coder))
+          test_dataset_prefix, coder, file_name_suffix=".tfrecords"))
 
     # Write the transform_fn
     _ = (
@@ -277,7 +277,12 @@ if __name__ == '__main__':
       '--metadata-file',
       required=False,
       default="train_metadata.csv",
-      help='Metadata file to use.'
+      help='Metadata file to use.')
+  parser.add_argument(
+      '--max-entries-per-class',
+      required=False,
+      default=5000,
+      help='Maximum number of entries to pick per class'
   )
   
   args, pipeline_args = parser.parse_known_args()
@@ -285,4 +290,4 @@ if __name__ == '__main__':
 
   beam_options = PipelineOptions(pipeline_args, save_main_session=True)
 
-  run_pipeline(work_dir, args.metadata_file, beam_options, float(args.test_percent), float(args.val_percent))
+  run_pipeline(work_dir, args.metadata_file, beam_options, float(args.test_percent), float(args.val_percent), args.max_entries_per_class)
